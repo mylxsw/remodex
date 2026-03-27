@@ -178,7 +178,9 @@ struct ContentView: View {
             }
         } else if subscriptions.bootstrapState == .failed {
             SubscriptionBootstrapFailureView()
-        } else if subscriptions.bootstrapState != .ready || !subscriptions.hasProAccess {
+        } else if subscriptions.bootstrapState != .ready {
+            // Pro subscription check removed - always grant access
+            // Original: || !subscriptions.hasProAccess
             SubscriptionGateView()
         } else if shouldShowQRScanner {
             qrScannerBody

@@ -58,7 +58,7 @@ final class SubscriptionService {
     private(set) var customerInfo: CustomerInfo?
     private(set) var currentOffering: Offering?
     private(set) var packageOptions: [SubscriptionPackageOption] = []
-    private(set) var hasProAccess = false
+    private(set) var hasProAccess = true
     private(set) var latestPurchaseDate: Date?
     private(set) var willRenew = false
     private(set) var managementURL: URL?
@@ -255,7 +255,7 @@ private extension SubscriptionService {
     func applyCustomerInfo(_ info: CustomerInfo) {
         customerInfo = info
         let entitlement = info.entitlements.all[AppEnvironment.revenueCatEntitlementName]
-        hasProAccess = entitlement?.isActive == true
+        hasProAccess = true // Bypass Pro check - always grant Pro access
         hasCachedOptimisticAccess = hasProAccess
         latestPurchaseDate = entitlement?.latestPurchaseDate
         willRenew = entitlement?.willRenew == true
@@ -271,8 +271,8 @@ private extension SubscriptionService {
             return
         }
 
-        hasProAccess = cachedState.hasProAccess
-        hasCachedOptimisticAccess = cachedState.hasProAccess
+        hasProAccess = true // Bypass Pro check - always grant Pro access
+        hasCachedOptimisticAccess = true
         latestPurchaseDate = cachedState.latestPurchaseDate
         willRenew = cachedState.willRenew
         managementURL = cachedState.managementURLString.flatMap(URL.init(string:))
