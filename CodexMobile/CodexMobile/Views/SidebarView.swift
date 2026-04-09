@@ -24,6 +24,7 @@ struct SidebarView: View {
     @State private var threadPendingDeletion: CodexThread? = nil
     @State private var createThreadErrorMessage: String? = nil
     @State private var cachedDiffTotals: [String: TurnSessionDiffTotals] = [:]
+    @State private var cachedDiffRevisionByThreadID: [String: Int] = [:]
     @State private var cachedRunBadges: [String: CodexThreadRunBadgeState] = [:]
     @State private var lastDiffFingerprint: Int = 0
     @State private var lastBadgeFingerprint: Int = 0
@@ -139,6 +140,9 @@ struct SidebarView: View {
                 onSelectProject: { projectPath in
                     handleNewChatTap(preferredProjectPath: projectPath)
                 },
+                onSelectWorktreeProject: { projectPath in
+                    handleNewWorktreeChatTap(preferredProjectPath: projectPath)
+                },
                 onSelectWithoutProject: {
                     handleNewChatTap(preferredProjectPath: nil)
                 }
@@ -226,13 +230,37 @@ struct SidebarView: View {
             defer { isCreatingThread = false }
 
             do {
-                let thread = try await codex.startThreadIfReady(preferredProjectPath: preferredProjectPath)
+                let thread = try await WorktreeFlowCoordinator.startNewLocalChat(
+                    preferredProjectPath: preferredProjectPath,
+                    codex: codex
+                )
                 selectedThread = thread
                 onClose()
             } catch {
                 let message = error.localizedDescription
                 codex.lastErrorMessage = message
                 createThreadErrorMessage = message.isEmpty ? "Unable to create a chat right now." : message
+            }
+        }
+    }
+
+    private func handleNewWorktreeChatTap(preferredProjectPath: String) {
+        Task { @MainActor in
+            createThreadErrorMessage = nil
+            isCreatingThread = true
+            defer { isCreatingThread = false }
+
+            do {
+                let thread = try await WorktreeFlowCoordinator.startNewWorktreeChat(
+                    preferredProjectPath: preferredProjectPath,
+                    codex: codex
+                )
+                selectedThread = thread
+                onClose()
+            } catch {
+                let message = error.localizedDescription
+                codex.lastErrorMessage = message
+                createThreadErrorMessage = message.isEmpty ? "Unable to create a worktree chat right now." : message
             }
         }
     }
@@ -289,6 +317,7 @@ struct SidebarView: View {
     // Cheap fingerprint: hashes thread IDs + message revisions (O(n) integer work, no message access).
     private var diffFingerprint: Int {
         var hasher = Hasher()
+        hasher.combine(codex.hasAnyRunningTurn)
         for thread in codex.threads {
             hasher.combine(thread.id)
             hasher.combine(codex.messageRevision(for: thread.id))
@@ -316,19 +345,25 @@ struct SidebarView: View {
     private func rebuildCachedDiffTotals() {
         let fp = diffFingerprint
         guard fp != lastDiffFingerprint else { return }
+        // Keep streaming smooth: diff totals are sidebar-only and can wait until active runs settle.
+        guard !codex.hasAnyRunningTurn else { return }
         lastDiffFingerprint = fp
 
-        var byThreadID: [String: TurnSessionDiffTotals] = [:]
+        let currentThreadIDs = Set(codex.threads.map(\.id))
+        cachedDiffTotals = cachedDiffTotals.filter { currentThreadIDs.contains($0.key) }
+        cachedDiffRevisionByThreadID = cachedDiffRevisionByThreadID.filter { currentThreadIDs.contains($0.key) }
+
         for thread in codex.threads {
+            let revision = codex.messageRevision(for: thread.id)
+            guard cachedDiffRevisionByThreadID[thread.id] != revision else { continue }
+
             let messages = codex.messages(for: thread.id)
-            if let totals = TurnSessionDiffSummaryCalculator.totals(
+            cachedDiffTotals[thread.id] = TurnSessionDiffSummaryCalculator.totals(
                 from: messages,
                 scope: .unpushedSession
-            ) {
-                byThreadID[thread.id] = totals
-            }
+            )
+            cachedDiffRevisionByThreadID[thread.id] = revision
         }
-        cachedDiffTotals = byThreadID
     }
 
     private func rebuildCachedRunBadges() {
@@ -365,6 +400,7 @@ enum SidebarThreadsLoadingPresentation {
 private struct SidebarNewChatProjectPickerSheet: View {
     let choices: [SidebarProjectChoice]
     let onSelectProject: (String) -> Void
+    let onSelectWorktreeProject: (String) -> Void
     let onSelectWithoutProject: () -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -405,6 +441,35 @@ private struct SidebarNewChatProjectPickerSheet: View {
                     }
                 }
 
+                if !choices.isEmpty {
+                    Section("Worktree") {
+                        ForEach(choices) { choice in
+                            Button {
+                                dismiss()
+                                onSelectWorktreeProject(choice.projectPath)
+                            } label: {
+                                HStack(alignment: .top, spacing: 12) {
+                                    CodexWorktreeIcon(pointSize: 16, weight: .medium)
+                                        .foregroundStyle(.secondary)
+
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(choice.label)
+                                            .font(AppFont.body(weight: .semibold))
+                                            .foregroundStyle(.primary)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                                        Text("Start a new chat in a managed detached worktree from the repo default branch.")
+                                            .font(AppFont.body())
+                                            .foregroundStyle(.secondary)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                }
+                                .padding(.vertical, 2)
+                            }
+                        }
+                    }
+                }
+
                 Section {
                     Button {
                         dismiss()
@@ -433,7 +498,7 @@ private struct SidebarNewChatProjectPickerSheet: View {
 
                 Section {
                     // Explains the existing scoping rule at the exact moment the user chooses it.
-                    Text("Chats started in a project stay scoped to that working directory. If you pick Cloud, the chat is global.")
+                    Text("Chats started in a project stay scoped to that working directory. Worktree chats start in a managed detached worktree. If you pick Cloud, the chat is global.")
                         .font(AppFont.caption())
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

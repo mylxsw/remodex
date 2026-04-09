@@ -18,6 +18,7 @@ struct TurnToolbarContent: ToolbarContent {
     let isHandingOffToMac: Bool
     let isStartingNewChat: Bool
     let canHandOffToWorktree: Bool
+    let worktreeHandoffTitle: String
     let isCreatingGitWorktree: Bool
     let repoDiffTotals: GitDiffTotals?
     let isLoadingRepoDiff: Bool
@@ -36,7 +37,7 @@ struct TurnToolbarContent: ToolbarContent {
     @Binding var isShowingPathSheet: Bool
 
     var body: some ToolbarContent {
-        let hasTrailingCluster = repoDiffTotals != nil || showsGitActions
+        let hasTrailingCluster = repoDiffTotals != nil
         let isThreadActionLoading = isHandingOffToMac || isStartingNewChat
         let canTapMacHandoff = onTapMacHandoff != nil && !isThreadActionLoading
         let canTapWorktreeHandoff = onTapWorktreeHandoff != nil
@@ -90,7 +91,7 @@ struct TurnToolbarContent: ToolbarContent {
                         onTapWorktreeHandoff?()
                     } label: {
                         CodexWorktreeMenuLabelRow(
-                            title: isCreatingGitWorktree ? "Creating worktree..." : "Hand off to worktree",
+                            title: isCreatingGitWorktree ? "Preparing worktree..." : worktreeHandoffTitle,
                             pointSize: 12,
                             weight: .regular
                         )
@@ -120,24 +121,13 @@ struct TurnToolbarContent: ToolbarContent {
             }
         }
 
-        if repoDiffTotals != nil || showsGitActions {
+        if repoDiffTotals != nil {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 if let repoDiffTotals {
                     TurnToolbarDiffTotalsLabel(
                         totals: repoDiffTotals,
                         isLoading: isLoadingRepoDiff,
                         onTap: onTapRepoDiff
-                    )
-                }
-
-                if showsGitActions {
-                    TurnGitActionsToolbarButton(
-                        isEnabled: isGitActionEnabled,
-                        disabledActions: disabledGitActions,
-                        isRunningAction: isRunningGitAction,
-                        showsDiscardRuntimeChangesAndSync: showsDiscardRuntimeChangesAndSync,
-                        gitSyncState: gitSyncState,
-                        onSelect: onGitAction
                     )
                 }
             }

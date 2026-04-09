@@ -14,6 +14,27 @@ import UIKit
 // plain markdown rows and Mermaid-interleaved markdown segments.
 let enablesInlineMarkdownSelectionInTimeline = false
 
+// Normalizes streaming placeholders once so assistant rows do not render transient status text
+// like "Thinking..." as if it were final message content.
+func timelineDisplayText(for message: CodexMessage) -> String {
+    let trimmedText = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    if message.isStreaming {
+        let placeholderTexts: Set<String> = [
+            "...",
+            "Thinking...",
+            "Applying file changes...",
+            "Updating...",
+            "Coordinating agents...",
+            "Planning...",
+            "Waiting for input...",
+        ]
+        if trimmedText.isEmpty || placeholderTexts.contains(trimmedText) {
+            return ""
+        }
+    }
+    return trimmedText
+}
+
 // ─── Message content views ──────────────────────────────────────────
 
 // ─── File-Change Recap UI ─────────────────────────────────────
@@ -566,6 +587,13 @@ struct MessageRow: View, Equatable {
     let onRetryUserMessage: (String) -> Void
     // Keeps the end-of-block accessory aligned with the active assistant turn.
     var assistantBlockAccessoryState: AssistantBlockAccessoryState? = nil
+    var planSessionSource: CodexPlanSessionSource? = nil
+    var allowsAssistantPlanFallbackRecovery: Bool = false
+    var assistantTurnCompleted: Bool = false
+    var threadMessagesForPlanMatching: [CodexMessage] = []
+    // Narrow token for inferred-plan fallback invalidation; this changes only when the
+    // relevant native structured prompts change, not on every unrelated service mutation.
+    var planMatchingFingerprint: Int = 0
     // Disables timer-driven adornments while the user reads older content.
     var showsStreamingAnimations: Bool = true
     // Passed as init params instead of @Environment so .equatable() can short-circuit
@@ -579,27 +607,16 @@ struct MessageRow: View, Equatable {
         lhs.message == rhs.message
             && lhs.isRetryAvailable == rhs.isRetryAvailable
             && lhs.assistantBlockAccessoryState == rhs.assistantBlockAccessoryState
+            && lhs.planSessionSource == rhs.planSessionSource
+            && lhs.allowsAssistantPlanFallbackRecovery == rhs.allowsAssistantPlanFallbackRecovery
+            && lhs.assistantTurnCompleted == rhs.assistantTurnCompleted
+            && lhs.planMatchingFingerprint == rhs.planMatchingFingerprint
             && lhs.showsStreamingAnimations == rhs.showsStreamingAnimations
     }
 
     // Computed once per body evaluation and reused by all sub-views.
     private var displayText: String {
-        let trimmedText = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if message.isStreaming {
-            let placeholderTexts: Set<String> = [
-                "...",
-                "Thinking...",
-                "Applying file changes...",
-                "Updating...",
-                "Coordinating agents...",
-                "Planning...",
-                "Waiting for input...",
-            ]
-            if trimmedText.isEmpty || placeholderTexts.contains(trimmedText) {
-                return ""
-            }
-        }
-        return trimmedText
+        timelineDisplayText(for: message)
     }
 
     var body: some View {
@@ -624,6 +641,8 @@ struct MessageRow: View, Equatable {
                         )
                     }
                 }
+                // Keep block-end actions pinned left when a system row is the last item in a turn.
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .sheet(item: $selectableTextSheet) { sheet in
@@ -821,7 +840,45 @@ struct MessageRow: View, Equatable {
         let commentContent = renderModel.codeCommentContent
         let bodyText = commentContent?.fallbackText ?? text
         let mermaidContent = renderModel.mermaidContent
-
+        let assistantProposedPlanCandidate = commentContent == nil && mermaidContent == nil
+            ? (message.proposedPlan ?? CodexProposedPlanParser.parse(from: bodyText))
+            : nil
+        let currentPlanSessionSource = planSessionSource
+        let isNativePlanSession = currentPlanSessionSource != nil && currentPlanSessionSource != .compatibilityFallback
+        let proposedPlan = !isNativePlanSession
+            ? (assistantProposedPlanCandidate
+                ?? (
+                    commentContent == nil
+                        && mermaidContent == nil
+                        && currentPlanSessionSource == .compatibilityFallback
+                        && InferredPlanQuestionnaireParser.parseAssistantMessage(bodyText) == nil
+                    ? CodexProposedPlanParser.parseAssistantFallback(from: bodyText)
+                            : nil
+                ))
+            : nil
+        let renderedPlanText = assistantProposedPlanCandidate == nil
+            ? bodyText
+            : (
+                CodexProposedPlanParser.containsEnvelope(in: bodyText)
+                    ? (CodexProposedPlanParser.removingEnvelope(from: bodyText) ?? "")
+                    : ""
+            )
+        let inferredQuestionnaire = commentContent == nil
+            ? resolvedInferredPlanQuestionnaire(
+                bodyText: bodyText,
+                message: message,
+                threadMessages: threadMessagesForPlanMatching,
+                shouldRecoverFallback: allowsAssistantPlanFallbackRecovery,
+                parse: InferredPlanQuestionnaireParser.parseAssistantMessage
+            )
+            : nil
+        let visibleAssistantText = renderedPlanText
+        let suppressNativeProposedPlanShell = isNativePlanSession
+            && assistantProposedPlanCandidate != nil
+            && visibleAssistantText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && inferredQuestionnaire == nil
+            && mermaidContent == nil
+        let hasRenderableAssistantContent = !visibleAssistantText.isEmpty || proposedPlan != nil
         return VStack(alignment: .leading, spacing: 8) {
             if let commentContent, commentContent.hasFindings {
                 VStack(alignment: .leading, spacing: 10) {
@@ -831,27 +888,63 @@ struct MessageRow: View, Equatable {
                 }
             }
 
-            if !bodyText.isEmpty {
+            if hasRenderableAssistantContent {
                 if let mermaidContent {
                     MermaidMarkdownContentView(content: mermaidContent)
+                } else if let inferredQuestionnaire {
+                    if let introText = inferredQuestionnaire.introText {
+                        MarkdownTextView(
+                            text: introText,
+                            profile: .assistantProse,
+                            enablesSelection: enablesInlineMarkdownSelectionInTimeline
+                        )
+                    }
+
+                    InferredPlanQuestionnaireCard(
+                        message: message,
+                        questionnaire: inferredQuestionnaire
+                    )
+
+                    if let outroText = inferredQuestionnaire.outroText {
+                        Text(outroText)
+                            .font(AppFont.footnote())
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else if let proposedPlan {
+                    // Compatibility-mode proposed plans still render inline from assistant text.
+                    if !renderedPlanText.isEmpty {
+                        MarkdownTextView(
+                            text: renderedPlanText,
+                            profile: .assistantProse,
+                            enablesSelection: enablesInlineMarkdownSelectionInTimeline
+                        )
+                    }
+
+                    ProposedPlanResultCard(
+                        threadId: message.threadId,
+                        proposedPlan: proposedPlan,
+                        isStreaming: message.isStreaming,
+                        canImplement: assistantTurnCompleted
+                    )
                 } else {
                     MarkdownTextView(
-                        text: bodyText,
+                        text: visibleAssistantText,
                         profile: .assistantProse,
                         enablesSelection: enablesInlineMarkdownSelectionInTimeline
                     )
                 }
             }
 
-            if message.isStreaming && showsStreamingAnimations {
+            if !suppressNativeProposedPlanShell && message.isStreaming && showsStreamingAnimations {
                 TypingIndicator()
             }
 
-            if hasTurnEndActions {
+            if !suppressNativeProposedPlanShell && hasTurnEndActions {
                 turnEndActionButtons
             }
 
-            if let assistantBlockAccessoryState {
+            if !suppressNativeProposedPlanShell, let assistantBlockAccessoryState {
                 CopyBlockButton(
                     text: assistantBlockAccessoryState.copyText,
                     isRunning: assistantBlockAccessoryState.showsRunningIndicator
@@ -878,7 +971,17 @@ struct MessageRow: View, Equatable {
         case .subagentAction:
             subagentActionSystemView(text: text)
         case .plan:
-            PlanSystemCard(message: message)
+            if message.resolvedPlanPresentation?.isInlineResultVisible == true,
+               let proposedPlan = message.proposedPlan {
+                ProposedPlanResultCard(
+                    threadId: message.threadId,
+                    proposedPlan: proposedPlan,
+                    isStreaming: message.isStreaming,
+                    canImplement: message.resolvedPlanPresentation == .resultReady
+                )
+            } else {
+                PlanSystemCard(message: message)
+            }
         case .userInputPrompt:
             if let request = message.structuredUserInputRequest {
                 StructuredUserInputCard(request: request)
@@ -1013,12 +1116,21 @@ struct MessageRow: View, Equatable {
     }
 
     @Environment(\.inlineCommitAndPushAction) private var inlineCommitAction
+    @Environment(\.inlineCommitAndPushPhase) private var inlineCommitAndPushPhase
     @State private var isShowingBlockDiffSheet = false
 
     private var hasTurnEndActions: Bool {
         guard let accessory = assistantBlockAccessoryState else { return false }
         return accessory.blockRevertPresentation != nil
             || accessory.blockDiffEntries != nil
+    }
+
+    private var isInlineCommitAndPushRunning: Bool {
+        inlineCommitAndPushPhase != nil
+    }
+
+    private var inlineCommitAndPushTitle: String {
+        inlineCommitAndPushPhase?.title ?? "Commit & Push"
     }
 
     @ViewBuilder
@@ -1065,12 +1177,20 @@ struct MessageRow: View, Equatable {
                             action()
                         } label: {
                             HStack(spacing: 4) {
-                                Image("cloud-upload")
-                                    .renderingMode(.template)
-                                    .resizable()
-                                    .scaledToFit()
+                                // Mirror the top-bar git feedback so the inline CTA feels responsive too.
+                                Group {
+                                    if isInlineCommitAndPushRunning {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                    } else {
+                                        Image("cloud-upload")
+                                            .renderingMode(.template)
+                                            .resizable()
+                                            .scaledToFit()
+                                    }
+                                }
                                     .frame(width: 18, height: 18)
-                                Text("Commit & Push")
+                                Text(inlineCommitAndPushTitle)
                             }
                             .font(AppFont.mono(.body))
                             .padding(.horizontal, 14)
@@ -1078,6 +1198,7 @@ struct MessageRow: View, Equatable {
                             .adaptiveGlass(.regular, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                         }
                         .buttonStyle(.plain)
+                        .disabled(isInlineCommitAndPushRunning)
                     }
                 }
             }
